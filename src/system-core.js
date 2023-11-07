@@ -239,11 +239,25 @@ function topLevelLoad (loader, load) {
 // the closest we can get to call(undefined)
 var nullContext = Object.freeze(Object.create(null));
 
+// Equivalent to `Promise.prototype.finally`
+// https://gist.github.com/developit/d970bac18430943e4b3392b029a2a96c
+var promisePrototypeFinally = Promise.prototype.finally || function (callback) {
+    if (typeof callback !== 'function') {
+        return this.then(callback, callback);
+    }
+    const P = this.constructor || Promise;
+    return this.then(
+        value => P.resolve(callback()).then(() => value),
+        err => P.resolve(callback()).then(() => { throw err; }),
+    );
+}
+
 // returns a promise if and only if a top-level await subgraph
 // throws on sync errors
 function postOrderExec (loader, load, seen) {
-  if (seen[load.id])
-    return;
+  if (seen[load.id]) {
+    return load.E;
+  }
   seen[load.id] = true;
 
   if (!load.e) {
@@ -254,6 +268,16 @@ function postOrderExec (loader, load, seen) {
     return;
   }
 
+  // From here we're about to execute the load.
+  // Because the execution may be async, we pop the `load.e` first.
+  // So `load.e === null` always means the load has been executed or is executing.
+  // To inspect the state:
+  // - If `load.er` is truthy, the execution has threw or has been rejected;
+  // - otherwise, either the `load.E` is a promise, means it's under async execution, or
+  // - the `load.E` is null, means the load has completed the execution or has been async resolved.
+  const exec = load.e;
+  load.e = null;
+
   // deps execute first, unless circular
   var depLoadPromises;
   load.d.forEach(function (depLoad) {
@@ -263,32 +287,36 @@ function postOrderExec (loader, load, seen) {
         (depLoadPromises = depLoadPromises || []).push(depLoadPromise);
     }
     catch (err) {
-      load.e = null;
       load.er = err;
       if (!process.env.SYSTEM_PRODUCTION) triggerOnload(loader, load, err, false);
       throw err;
     }
   });
   if (depLoadPromises)
-    return Promise.all(depLoadPromises).then(doExec);
+    return load.E = promisePrototypeFinally.call(Promise.all(depLoadPromises).then(doExec), function() {
+        load.E = null;
+    });
 
-  return doExec();
+  var execPromise = doExec();
+  if (execPromise) {
+    return load.E = promisePrototypeFinally.call(execPromise, function() {
+        load.E = null;
+    });
+  }
 
   function doExec () {
     try {
-      var execPromise = load.e.call(nullContext);
+      var execPromise = exec.call(nullContext);
       if (execPromise) {
         execPromise = execPromise.then(function () {
           load.C = load.n;
-          load.E = null; // indicates completion
           if (!process.env.SYSTEM_PRODUCTION) triggerOnload(loader, load, null, true);
         }, function (err) {
           load.er = err;
-          load.E = null;
           if (!process.env.SYSTEM_PRODUCTION) triggerOnload(loader, load, err, true);
           throw err;
         });
-        return load.E = execPromise;
+        return execPromise;
       }
       // (should be a promise, but a minify optimization to leave out Promise.resolve)
       load.C = load.n;
@@ -299,7 +327,6 @@ function postOrderExec (loader, load, seen) {
       throw err;
     }
     finally {
-      load.e = null;
       if (!process.env.SYSTEM_PRODUCTION) triggerOnload(loader, load, load.er, true);
     }
   }
